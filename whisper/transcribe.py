@@ -1,6 +1,7 @@
 import argparse
 import time
 import os
+import cupy as cp
 import warnings
 from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 
@@ -9,7 +10,7 @@ import torch
 import tqdm
 import string
 from dtw import dtw
-from scipy.ndimage import median_filter
+from cupyx.scipy.signal import medfilt
 
 from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
 from .decoding import DecodingOptions, DecodingResult
@@ -201,7 +202,7 @@ def transcribe(
         all_tokens.extend(initial_prompt)
 
     def add_segment(
-        *, start: float, end: float, text_tokens: torch.Tensor, audio_duration: float, result: DecodingResult
+        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult
     ):
         text = tokenizer.decode([token for token in text_tokens if token < tokenizer.eot])
         if len(text.strip()) == 0:  # skip empty text output
@@ -213,7 +214,6 @@ def transcribe(
                 "seek": seek,
                 "start": start,
                 "end": end,
-                "audio_duration": audio_duration,
                 "text": text,
                 "tokens": text_tokens.tolist(),
                 "temperature": result.temperature,
@@ -265,11 +265,10 @@ def transcribe(
                 start=timestamp_offset,
                 end=timestamp_offset + duration,
                 text_tokens=tokens,
-                audio_duration=segment_duration,
                 result=result,
             )
             
-            ideal_number_of_tokens = int(segment_duration * SAMPLE_RATE // samples_per_token)
+            ideal_number_of_tokens = int(duration * SAMPLE_RATE // samples_per_token)
             tokens_ts = torch.tensor(
                 [
                     *tokenizer.sot_sequence,
@@ -285,8 +284,8 @@ def transcribe(
 
             weights = torch.concatenate(QKs)  # layers * heads * tokens * frames
             weights = weights[:, :, :, : ideal_number_of_tokens].cpu()
-            st = time.time()
-            weights = median_filter(weights, (1, 1, 1, medfilt_width))
+            weights = medfilt(cp.asarray(weights), (1, 1, 1, medfilt_width))
+            weights = torch.as_tensor(weights, device='cpu')
             weights = torch.tensor(weights * qk_scale).softmax(dim=-1)
 
             w = weights / weights.norm(dim=-2, keepdim=True)
@@ -305,7 +304,10 @@ def transcribe(
             all_segments[-1]['word_timestamps'] = [
                 dict(word=word, begin=timestamp_offset + begin, end=timestamp_offset + end)
                 for word, begin, end in zip(words[:-1], begin_times, end_times)
-                if not word.startswith("<|") and word.strip() not in "、。"
+                # In case of hallucinations, our alogorithm will try to align a relatively
+                # long text over a relatively small duration. This will cause hallucinated
+                # words to have same `begin` and `end` time complexity.
+                if not word.startswith("<|") and word.strip() not in "、。" and end - begin > 0
             ]
 
             seek += segment.shape[-1]
