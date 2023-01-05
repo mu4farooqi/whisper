@@ -1,4 +1,5 @@
 import argparse
+import time
 import os
 import warnings
 from typing import List, Optional, Tuple, Union, TYPE_CHECKING
@@ -6,6 +7,9 @@ from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 import numpy as np
 import torch
 import tqdm
+import string
+from dtw import dtw
+from scipy.ndimage import median_filter
 
 from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
 from .decoding import DecodingOptions, DecodingResult
@@ -98,7 +102,49 @@ def transcribe(
     language = decode_options["language"]
     task = decode_options.get("task", "transcribe")
     tokenizer = get_tokenizer(model.is_multilingual, language=language, task=task)
+    
+    def split_tokens_on_unicode(tokens: torch.Tensor):
+        words = []
+        word_tokens = []
+        current_tokens = []
 
+        for token in tokens.tolist():
+            current_tokens.append(token)
+            decoded = tokenizer.decode_with_timestamps(current_tokens)
+            if "\ufffd" not in decoded:
+                words.append(decoded)
+                word_tokens.append(current_tokens)
+                current_tokens = []
+
+        return words, word_tokens
+
+    def split_tokens_on_spaces(tokens: torch.Tensor):
+        subwords, subword_tokens_list = split_tokens_on_unicode(tokens)
+        words = []
+        word_tokens = []
+
+        for subword, subword_tokens in zip(subwords, subword_tokens_list):
+            special = subword_tokens[0] >= tokenizer.eot
+            with_space = subword.startswith(" ")
+            punctuation = subword.strip() in string.punctuation
+            if special or with_space or punctuation:
+                words.append(subword)
+                word_tokens.append(subword_tokens)
+            else:
+                words[-1] = words[-1] + subword
+                word_tokens[-1].extend(subword_tokens)
+
+        return words, word_tokens
+    
+    if LANGUAGES[language].title() in {"Chinese", "Japanese", "Thai", "Lao", "Myanmar"}:
+        # These languages don't typically use spaces, so it is difficult to split words
+        # without morpheme analysis. Here, we instead split words at any
+        # position where the tokens are decoded as valid unicode points
+        split_tokens = split_tokens_on_unicode
+    else:
+        split_tokens = split_tokens_on_spaces
+
+        
     def decode_with_fallback(segment: torch.Tensor) -> DecodingResult:
         temperatures = [temperature] if isinstance(temperature, (int, float)) else temperature
         decode_result = None
@@ -126,6 +172,14 @@ def transcribe(
                 break
 
         return decode_result
+    
+    # Install hooks on the cross attention layers to retrieve the attention weights 
+    QKs = [None] * model.dims.n_text_layer
+
+    for i, block in enumerate(model.decoder.blocks):
+        block.cross_attn.register_forward_hook(
+            lambda _, ins, outs, index=i: QKs.__setitem__(index, outs[-1])
+        )
 
     seek = 0
     input_stride = exact_div(
@@ -134,9 +188,12 @@ def transcribe(
     time_precision = (
         input_stride * HOP_LENGTH / SAMPLE_RATE
     )  # time per output token: 0.02 (seconds)
+    samples_per_token = int(input_stride * HOP_LENGTH)
     all_tokens = []
     all_segments = []
     prompt_reset_since = 0
+    medfilt_width = 7
+    qk_scale = 1.0
 
     initial_prompt = decode_options.pop("initial_prompt", None) or []
     if initial_prompt:
@@ -144,7 +201,7 @@ def transcribe(
         all_tokens.extend(initial_prompt)
 
     def add_segment(
-        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, text_tokens: torch.Tensor, audio_duration: float, result: DecodingResult
     ):
         text = tokenizer.decode([token for token in text_tokens if token < tokenizer.eot])
         if len(text.strip()) == 0:  # skip empty text output
@@ -156,6 +213,7 @@ def transcribe(
                 "seek": seek,
                 "start": start,
                 "end": end,
+                "audio_duration": audio_duration,
                 "text": text,
                 "tokens": text_tokens.tolist(),
                 "temperature": result.temperature,
@@ -174,8 +232,10 @@ def transcribe(
     with tqdm.tqdm(total=num_frames, unit='frames', disable=verbose is not False) as pbar:
         while seek < num_frames:
             timestamp_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
-            segment = pad_or_trim(mel[:, seek:], N_FRAMES).to(model.device).to(dtype)
+            uncasted_segment = pad_or_trim(mel[:, seek:], N_FRAMES).to(model.device)
+            segment = uncasted_segment.to(dtype)
             segment_duration = segment.shape[-1] * HOP_LENGTH / SAMPLE_RATE
+
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(segment)
@@ -193,47 +253,63 @@ def transcribe(
                     continue
 
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
-            consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
-            if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
-                last_slice = 0
-                for current_slice in consecutive:
-                    sliced_tokens = tokens[last_slice:current_slice]
-                    start_timestamp_position = (
-                        sliced_tokens[0].item() - tokenizer.timestamp_begin
-                    )
-                    end_timestamp_position = (
-                        sliced_tokens[-1].item() - tokenizer.timestamp_begin
-                    )
-                    add_segment(
-                        start=timestamp_offset + start_timestamp_position * time_precision,
-                        end=timestamp_offset + end_timestamp_position * time_precision,
-                        text_tokens=sliced_tokens[1:-1],
-                        result=result,
-                    )
-                    last_slice = current_slice
-                last_timestamp_position = (
-                    tokens[last_slice - 1].item() - tokenizer.timestamp_begin
-                )
-                seek += last_timestamp_position * input_stride
-                all_tokens.extend(tokens[: last_slice + 1].tolist())
-            else:
-                duration = segment_duration
-                timestamps = tokens[timestamp_tokens.nonzero().flatten()]
-                if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
-                    # no consecutive timestamps but it has a timestamp; use the last one.
-                    # single timestamp at the end means no speech after the last timestamp.
-                    last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
-                    duration = last_timestamp_position * time_precision
+            duration = segment_duration
+            timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+            if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
+                # no consecutive timestamps but it has a timestamp; use the last one.
+                # single timestamp at the end means no speech after the last timestamp.
+                last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
+                duration = last_timestamp_position * time_precision
+                
+            add_segment(
+                start=timestamp_offset,
+                end=timestamp_offset + duration,
+                text_tokens=tokens,
+                audio_duration=segment_duration,
+                result=result,
+            )
+            
+            ideal_number_of_tokens = int(segment_duration * SAMPLE_RATE // samples_per_token)
+            tokens_ts = torch.tensor(
+                [
+                    *tokenizer.sot_sequence,
+                    tokenizer.timestamp_begin,
+                ] + tokenizer.encode(all_segments[-1]['text']) + [
+                    tokenizer.timestamp_begin + ideal_number_of_tokens,
+                    tokenizer.eot,
+                ]
+            ).cuda().long()
+            
+            with torch.no_grad():
+                logits = model(uncasted_segment.unsqueeze(0), tokens_ts.unsqueeze(0))
 
-                add_segment(
-                    start=timestamp_offset,
-                    end=timestamp_offset + duration,
-                    text_tokens=tokens,
-                    result=result,
-                )
+            weights = torch.concatenate(QKs)  # layers * heads * tokens * frames
+            weights = weights[:, :, :, : ideal_number_of_tokens].cpu()
+            st = time.time()
+            weights = median_filter(weights, (1, 1, 1, medfilt_width))
+            weights = torch.tensor(weights * qk_scale).softmax(dim=-1)
 
-                seek += segment.shape[-1]
-                all_tokens.extend(tokens.tolist())
+            w = weights / weights.norm(dim=-2, keepdim=True)
+            matrix = w[-6:].mean(axis=(0, 1))
+
+            alignment = dtw(-matrix.double().numpy())
+
+            jumps = np.pad(np.diff(alignment.index1s), (1, 0), constant_values=1).astype(bool)
+            jump_times = alignment.index2s[jumps] * time_precision
+            words, word_tokens = split_tokens(tokens_ts)
+            
+            word_boundaries = np.pad(np.cumsum([len(t) for t in word_tokens[:-1]]), (1, 0))
+            begin_times = jump_times[word_boundaries[:-1]]
+            end_times = jump_times[word_boundaries[1:]]
+
+            all_segments[-1]['word_timestamps'] = [
+                dict(word=word, begin=timestamp_offset + begin, end=timestamp_offset + end)
+                for word, begin, end in zip(words[:-1], begin_times, end_times)
+                if not word.startswith("<|") and word.strip() not in "、。"
+            ]
+
+            seek += segment.shape[-1]
+            all_tokens.extend(tokens.tolist())
 
             if not condition_on_previous_text or result.temperature > 0.5:
                 # do not feed the prompt tokens if a high temperature was used
