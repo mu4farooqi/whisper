@@ -12,7 +12,7 @@ import string
 from dtw import dtw
 from cupyx.scipy.signal import medfilt
 
-from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
+from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram, load_audio
 from .decoding import DecodingOptions, DecodingResult
 from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
 from .utils import exact_div, format_timestamp, optional_int, optional_float, str2bool, write_txt, write_vtt, write_srt
@@ -86,6 +86,19 @@ def transcribe(
     if dtype == torch.float32:
         decode_options["fp16"] = False
 
+    # Removes silences from the audio file. This results in better transcription quality
+    # without hallucinations.
+    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=True)
+    (get_speech_timestamps, _, read_audio, _, collect_chunks) = utils
+    if not torch.is_tensor(audio):
+        if isinstance(audio, str):
+            audio = read_audio(audio, sampling_rate=SAMPLE_RATE)
+        else:
+            audio = torch.from_numpy(audio)
+
+    speech_timestamps = get_speech_timestamps(audio, vad_model, sampling_rate=SAMPLE_RATE, window_size_samples=512)
+    audio = collect_chunks(speech_timestamps, audio)
+    
     mel = log_mel_spectrogram(audio)
 
     if decode_options.get("language", None) is None:
@@ -253,21 +266,47 @@ def transcribe(
                     continue
 
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
-            duration = segment_duration
-            timestamps = tokens[timestamp_tokens.nonzero().flatten()]
-            if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
-                # no consecutive timestamps but it has a timestamp; use the last one.
-                # single timestamp at the end means no speech after the last timestamp.
-                last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
+            consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
+            if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
+                last_slice = 0
+                text_tokens = []
+                for current_slice in consecutive:
+                    sliced_tokens = tokens[last_slice:current_slice]
+                    text_tokens.append(sliced_tokens[1:-1]),
+                    last_slice = current_slice
+                last_timestamp_position = (
+                    tokens[last_slice - 1].item() - tokenizer.timestamp_begin
+                )
                 duration = last_timestamp_position * time_precision
                 
-            add_segment(
-                start=timestamp_offset,
-                end=timestamp_offset + duration,
-                text_tokens=tokens,
-                result=result,
-            )
-            
+                add_segment(
+                    start=timestamp_offset,
+                    end=timestamp_offset + duration,
+                    text_tokens=torch.cat(text_tokens),
+                    result=result,
+                )
+                
+                seek += last_timestamp_position * input_stride
+                all_tokens.extend(tokens[: last_slice + 1].tolist())
+            else:
+                duration = segment_duration
+                timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+                if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
+                    # no consecutive timestamps but it has a timestamp; use the last one.
+                    # single timestamp at the end means no speech after the last timestamp.
+                    last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
+                    duration = last_timestamp_position * time_precision
+
+                add_segment(
+                    start=timestamp_offset,
+                    end=timestamp_offset + duration,
+                    text_tokens=tokens,
+                    result=result,
+                )
+
+                seek += segment.shape[-1]
+                all_tokens.extend(tokens.tolist())
+                
             ideal_number_of_tokens = int(duration * SAMPLE_RATE // samples_per_token)
             tokens_ts = torch.tensor(
                 [
@@ -307,11 +346,8 @@ def transcribe(
                 # In case of hallucinations, our alogorithm will try to align a relatively
                 # long text over a relatively small duration. This will cause hallucinated
                 # words to have same `begin` and `end` time complexity.
-                if not word.startswith("<|") and word.strip() not in "、。" and end - begin > 0
+                if not word.startswith("<|") and word.strip() not in "、。"
             ]
-
-            seek += segment.shape[-1]
-            all_tokens.extend(tokens.tolist())
 
             if not condition_on_previous_text or result.temperature > 0.5:
                 # do not feed the prompt tokens if a high temperature was used
