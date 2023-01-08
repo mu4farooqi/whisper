@@ -96,7 +96,7 @@ def transcribe(
         else:
             audio = torch.from_numpy(audio)
 
-    speech_timestamps = get_speech_timestamps(audio, vad_model, sampling_rate=SAMPLE_RATE, window_size_samples=512)
+    speech_timestamps = get_speech_timestamps(audio, vad_model, sampling_rate=SAMPLE_RATE, window_size_samples=512, speech_pad_ms=45, threshold=0.5)
     audio = collect_chunks(speech_timestamps, audio)
     
     mel = log_mel_spectrogram(audio)
@@ -206,6 +206,7 @@ def transcribe(
     all_tokens = []
     all_segments = []
     prompt_reset_since = 0
+    audio_duration_in_seconds = round(len(audio) / SAMPLE_RATE, 3)
     medfilt_width = 7
     qk_scale = 1.0
 
@@ -249,7 +250,6 @@ def transcribe(
             segment = uncasted_segment.to(dtype)
             segment_duration = segment.shape[-1] * HOP_LENGTH / SAMPLE_RATE
 
-
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(segment)
             tokens = torch.tensor(result.tokens)
@@ -270,22 +270,29 @@ def transcribe(
             if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
                 last_slice = 0
                 text_tokens = []
-                for current_slice in consecutive:
-                    sliced_tokens = tokens[last_slice:current_slice]
+                for idx, current_slice in enumerate(consecutive):
+                    sliced_tokens = tokens[last_slice:current_slice]                    
+                    if idx == 0:
+                        start_timestamp_position = (
+                            sliced_tokens[0].item() - tokenizer.timestamp_begin
+                        )
+                        start_timestamp = timestamp_offset + start_timestamp_position * time_precision
                     text_tokens.append(sliced_tokens[1:-1]),
                     last_slice = current_slice
+                
                 last_timestamp_position = (
                     tokens[last_slice - 1].item() - tokenizer.timestamp_begin
                 )
-                duration = last_timestamp_position * time_precision
-                
+                end_timestamp = min(timestamp_offset + last_timestamp_position * time_precision, audio_duration_in_seconds)
+
                 add_segment(
-                    start=timestamp_offset,
-                    end=timestamp_offset + duration,
+                    start=start_timestamp,
+                    end=end_timestamp,
                     text_tokens=torch.cat(text_tokens),
                     result=result,
                 )
                 
+                duration = end_timestamp - start_timestamp
                 seek += last_timestamp_position * input_stride
                 all_tokens.extend(tokens[: last_slice + 1].tolist())
             else:
@@ -297,6 +304,7 @@ def transcribe(
                     last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
                     duration = last_timestamp_position * time_precision
 
+                duration = min(duration, audio_duration_in_seconds - timestamp_offset)
                 add_segment(
                     start=timestamp_offset,
                     end=timestamp_offset + duration,
@@ -343,9 +351,6 @@ def transcribe(
             all_segments[-1]['word_timestamps'] = [
                 dict(word=word, begin=timestamp_offset + begin, end=timestamp_offset + end)
                 for word, begin, end in zip(words[:-1], begin_times, end_times)
-                # In case of hallucinations, our alogorithm will try to align a relatively
-                # long text over a relatively small duration. This will cause hallucinated
-                # words to have same `begin` and `end` time complexity.
                 if not word.startswith("<|") and word.strip() not in "、。"
             ]
 
