@@ -92,6 +92,7 @@ def transcribe(
         decode_options["fp16"] = False
         
     torch.cuda.set_per_process_memory_fraction(gpu_memory_fraction, 0)
+    torch.cuda.empty_cache()
 
     # Removes silences from the audio file. This results in better transcription quality
     # without hallucinations.
