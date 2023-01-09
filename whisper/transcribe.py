@@ -95,7 +95,7 @@ def transcribe(
 
     # Removes silences from the audio file. This results in better transcription quality
     # without hallucinations.
-    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=True)
+    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=True, trust_repo=True)
     (get_speech_timestamps, _, read_audio, _, collect_chunks) = utils
     if not torch.is_tensor(audio):
         if isinstance(audio, str):
