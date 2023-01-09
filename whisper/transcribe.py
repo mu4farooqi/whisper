@@ -31,6 +31,7 @@ def transcribe(
     logprob_threshold: Optional[float] = -1.0,
     no_speech_threshold: Optional[float] = 0.6,
     condition_on_previous_text: bool = True,
+    gpu_memory_fraction: float = 0.85,
     **decode_options,
 ):
     """
@@ -66,6 +67,10 @@ def transcribe(
         if True, the previous output of the model is provided as a prompt for the next window;
         disabling may make the text inconsistent across windows, but the model becomes less prone to
         getting stuck in a failure loop, such as repetition looping or timestamps going out of sync.
+    
+    gpu_memory_fraction: float
+        defined what fraction of gpu memory transcribe/translate operation should use. If memory usage
+        exceeds this fraction, pytorch will free some memory from its cache to fix fragmentation.
 
     decode_options: dict
         Keyword arguments to construct `DecodingOptions` instances
@@ -85,6 +90,8 @@ def transcribe(
 
     if dtype == torch.float32:
         decode_options["fp16"] = False
+        
+    torch.cuda.set_per_process_memory_fraction(gpu_memory_fraction, 0)
 
     # Removes silences from the audio file. This results in better transcription quality
     # without hallucinations.
@@ -325,15 +332,18 @@ def transcribe(
                     tokenizer.eot,
                 ]
             ).cuda().long()
+            words, word_tokens = split_tokens(tokens_ts)
             
             with torch.no_grad():
                 logits = model(uncasted_segment.unsqueeze(0), tokens_ts.unsqueeze(0))
+                
+            del tokens_ts, logits
 
-            weights = torch.concatenate(QKs)  # layers * heads * tokens * frames
-            weights = weights[:, :, :, : ideal_number_of_tokens].cpu()
-            weights = medfilt(cp.asarray(weights), (1, 1, 1, medfilt_width))
-            weights = torch.as_tensor(weights, device='cpu')
-            weights = torch.tensor(weights * qk_scale).softmax(dim=-1)
+            qk_weights = torch.concatenate(QKs)  # layers * heads * tokens * frames
+            cp_weights = cp.asarray(qk_weights[:, :, :, : ideal_number_of_tokens])
+            medfilter_weights = medfilt(cp_weights, (1, 1, 1, medfilt_width))
+            weights = torch.as_tensor(medfilter_weights, device='cpu') * qk_scale
+            weights = weights.clone().detach().softmax(dim=-1)
 
             w = weights / weights.norm(dim=-2, keepdim=True)
             matrix = w[-6:].mean(axis=(0, 1))
@@ -342,7 +352,6 @@ def transcribe(
 
             jumps = np.pad(np.diff(alignment.index1s), (1, 0), constant_values=1).astype(bool)
             jump_times = alignment.index2s[jumps] * time_precision
-            words, word_tokens = split_tokens(tokens_ts)
             
             word_boundaries = np.pad(np.cumsum([len(t) for t in word_tokens[:-1]]), (1, 0))
             begin_times = jump_times[word_boundaries[:-1]]
@@ -353,6 +362,9 @@ def transcribe(
                 for word, begin, end in zip(words[:-1], begin_times, end_times)
                 if not word.startswith("<|") and word.strip() not in "、。"
             ]
+            
+            # Free-up pytorch cache memory
+            del qk_weights, cp_weights, medfilter_weights, weights
 
             if not condition_on_previous_text or result.temperature > 0.5:
                 # do not feed the prompt tokens if a high temperature was used
